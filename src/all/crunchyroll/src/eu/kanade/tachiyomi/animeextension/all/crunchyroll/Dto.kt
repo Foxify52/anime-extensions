@@ -134,9 +134,13 @@ class SeasonDto(
         images?.posterTall.best() ?: images?.posterWide.best()
     }
 
-    // A season's own audio_locale is the account's preferred audio, not what
-    // exists; the other dubs are sibling seasons in versions.
-    fun guidFor(audioLocale: String): String = versions.firstOrNull { it.audioLocale == audioLocale }?.guid
+    // Every audio version of a season is a sibling with its own id, and which one
+    // the listing returns depends on the account. The original version's id is the
+    // same whichever sibling is returned, so it is what gets stored in URLs.
+    val stableId: String get() = versions.firstOrNull { it.original }?.guid ?: id
+
+    // A null locale means original audio.
+    fun guidFor(audioLocale: String?): String = versions.firstOrNull { it.audioLocale == audioLocale }?.guid
         ?: versions.firstOrNull { it.original }?.guid
         ?: id
 }
@@ -172,20 +176,18 @@ class EpisodeDto(
     val versions: List<VersionDto> = emptyList(),
 ) {
     // The episodes endpoint returns the account's preferred audio whichever season
-    // is asked, so id cannot be used directly.
-    fun guidFor(audioLocale: String?): String = versions.firstOrNull { it.audioLocale == audioLocale }?.guid
-        ?: versions.firstOrNull { it.original }?.guid
-        ?: id
+    // is asked, so id alone changes with the settings. The original version's id
+    // does not, so it is what gets stored in the episode URL.
+    val stableId: String get() = versions.firstOrNull { it.original }?.guid ?: id
 
     val date: String? get() = uploadDate ?: airDate
 
     fun toSEpisode(
         seasonLabel: String,
         dateMillis: Long,
-        audioLocale: String,
         numberOffset: Float = 0f,
     ): SEpisode = SEpisode.create().apply {
-        url = guidFor(audioLocale)
+        url = stableId
         episode_number = (episodeNumber ?: sequenceNumber) + numberOffset
         date_upload = dateMillis
         name = buildString {
@@ -200,6 +202,34 @@ class EpisodeDto(
 
 @Serializable
 class EpisodesResponseDto(val data: List<EpisodeDto> = emptyList())
+
+// ============================== Objects ===============================
+
+// Used to look up the audio versions of one episode from its stable id. Versions
+// are read from either place so the lookup does not depend on which shape the
+// objects endpoint returns.
+@Serializable
+class ObjectMetadataDto(
+    val versions: List<VersionDto> = emptyList(),
+)
+
+@Serializable
+class ObjectDto(
+    val id: String,
+    val versions: List<VersionDto> = emptyList(),
+    @SerialName("episode_metadata") val episodeMetadata: ObjectMetadataDto? = null,
+) {
+    // A null locale means original audio.
+    fun guidFor(audioLocale: String?): String {
+        val all = versions.ifEmpty { episodeMetadata?.versions.orEmpty() }
+        return all.firstOrNull { it.audioLocale == audioLocale }?.guid
+            ?: all.firstOrNull { it.original }?.guid
+            ?: id
+    }
+}
+
+@Serializable
+class ObjectsResponseDto(val data: List<ObjectDto> = emptyList())
 
 // ============================== Playback ==============================
 

@@ -1,20 +1,23 @@
 package eu.kanade.tachiyomi.animeextension.all.crunchyroll
 
+import android.content.SharedPreferences
 import android.text.InputType
 import android.util.Log
 import androidx.preference.PreferenceScreen
+import eu.kanade.tachiyomi.animesource.ConfigurableAnimeSource
 import eu.kanade.tachiyomi.animesource.model.AnimeFilterList
 import eu.kanade.tachiyomi.animesource.model.AnimesPage
+import eu.kanade.tachiyomi.animesource.model.Hoster
 import eu.kanade.tachiyomi.animesource.model.SAnime
 import eu.kanade.tachiyomi.animesource.model.SEpisode
 import eu.kanade.tachiyomi.animesource.model.Track
 import eu.kanade.tachiyomi.animesource.model.Video
+import eu.kanade.tachiyomi.animesource.online.AnimeHttpSource
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.network.POST
-import keiyoushi.utils.Source
 import keiyoushi.utils.addEditTextPreference
 import keiyoushi.utils.addListPreference
-import keiyoushi.utils.parallelCatchingMapNotNull
+import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
@@ -22,10 +25,16 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.serialization.Serializable
+import okhttp3.Call
 import okhttp3.CookieJar
 import okhttp3.FormBody
 import okhttp3.Headers
@@ -39,6 +48,8 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 import java.util.UUID
+import java.util.concurrent.TimeUnit
+import kotlin.math.ceil
 
 /**
  * Crunchyroll, using the user's own account.
@@ -46,7 +57,9 @@ import java.util.UUID
  * Streams are Widevine-protected DASH. The manifest and license endpoint are passed
  * to the player through [Video.internalData]; the device CDM does the key exchange.
  */
-class Crunchyroll : Source() {
+class Crunchyroll :
+    AnimeHttpSource(),
+    ConfigurableAnimeSource {
 
     override val name = "Crunchyroll"
 
@@ -55,6 +68,8 @@ class Crunchyroll : Source() {
     override val lang = "all"
 
     override val supportsLatest = true
+
+    private val preferences: SharedPreferences by getPreferencesLazy()
 
     init {
         // The app looks for a stored sub/dub value to decide whether to show its
@@ -74,11 +89,12 @@ class Crunchyroll : Source() {
     private val dubLocale get() = preferences.getString(PREF_AUDIO, PREF_AUDIO_DEFAULT)!!
 
     // Dubs are sibling seasons of one series, so the app's sub/dub switch flips
-    // PREF_AUDIO_TYPE instead of picking a different entry.
-    private val audioLocale: String
+    // PREF_AUDIO_TYPE instead of picking a different entry. Null means "whatever
+    // the original audio is" - not necessarily Japanese.
+    private val audioLocale: String?
         get() {
             val dubbed = preferences.getString(PREF_AUDIO_TYPE, PREF_AUDIO_TYPE_DEFAULT) == AUDIO_DUB
-            if (!dubbed) return ORIGINAL_LOCALE
+            if (!dubbed) return null
             return dubLocale.takeUnless { it == ORIGINAL_LOCALE } ?: FALLBACK_DUB_LOCALE
         }
     private val subtitleLocale get() = preferences.getString(PREF_SUB, PREF_SUB_DEFAULT)!!
@@ -119,20 +135,23 @@ class Crunchyroll : Source() {
             return chain.proceed(request)
         }
 
-        val response = chain.proceed(request.withToken(token()))
+        val used = token()
+        val response = chain.proceed(request.withToken(used))
         if (response.code != 401) return response
 
-        // Token rejected early (revoked profile switch, clock skew) - force one retry.
+        // Token rejected early (revoked profile switch, clock skew) - retry once. The
+        // rejected token is passed along so that a burst of 401s for the same stale
+        // token triggers one refresh, not one each.
         response.close()
-        return chain.proceed(request.withToken(token(force = true)))
+        return chain.proceed(request.withToken(token(rejected = used)))
     }
 
     private fun okhttp3.Request.withToken(token: String) = newBuilder().header("Authorization", "Bearer $token").build()
 
     @Synchronized
-    private fun token(force: Boolean = false): String {
+    private fun token(rejected: String? = null): String {
         val cached = accessToken
-        if (!force && cached != null && System.currentTimeMillis() < tokenExpiresAt) {
+        if (cached != null && cached != rejected && System.currentTimeMillis() < tokenExpiresAt) {
             return cached
         }
 
@@ -207,9 +226,15 @@ class Crunchyroll : Source() {
 
     override suspend fun getPopularAnime(page: Int): AnimesPage = browse(page, "popularity")
 
+    override fun popularAnimeRequest(page: Int) = throw UnsupportedOperationException()
+    override fun popularAnimeParse(response: Response) = throw UnsupportedOperationException()
+
     // =============================== Latest ===============================
 
     override suspend fun getLatestUpdates(page: Int): AnimesPage = browse(page, "newly_added")
+
+    override fun latestUpdatesRequest(page: Int) = throw UnsupportedOperationException()
+    override fun latestUpdatesParse(response: Response) = throw UnsupportedOperationException()
 
     private suspend fun browse(page: Int, sortBy: String): AnimesPage {
         val url = "$baseUrl/content/v2/discover/browse".toHttpUrl().newBuilder()
@@ -222,7 +247,7 @@ class Crunchyroll : Source() {
 
         val data = client.newCall(GET(url, headers)).execute().parseAs<BrowseResponseDto>()
         return AnimesPage(
-            data.data.map { it.toSAnime() },
+            data.data.toEntries(),
             page * PAGE_SIZE < data.total,
         )
     }
@@ -247,28 +272,33 @@ class Crunchyroll : Source() {
         val data = client.newCall(GET(url, headers)).execute().parseAs<SearchResponseDto>()
         val items = data.data.firstOrNull { it.type == "series" }?.items.orEmpty()
 
-        // Crunchyroll keeps sequels as seasons of one series while trackers list them
-        // as separate titles, so a multi-season series is offered one entry per season
-        // - otherwise both titles map here and their episode numbers collide.
-        val entries = items.parallelCatchingMapNotNull { item ->
-            if (item.seasonCount > 1) seasonEntries(item) else listOf(item.toSAnime())
-        }.flatten()
-
-        return AnimesPage(entries, items.size >= PAGE_SIZE)
+        return AnimesPage(items.toEntries(), items.size >= PAGE_SIZE)
     }
 
+    override fun searchAnimeRequest(page: Int, query: String, filters: AnimeFilterList) = throw UnsupportedOperationException()
+    override fun searchAnimeParse(response: Response) = throw UnsupportedOperationException()
+
+    // Crunchyroll keeps sequels as seasons of one series while trackers list them
+    // as separate titles, so a multi-season series is offered one entry per season
+    // - otherwise both titles map here and their episode numbers collide. Used by
+    // browse and search alike so every listing behaves the same. A failed season
+    // lookup fails the page (and can be retried) instead of silently showing a
+    // combined entry.
+    private suspend fun List<ContentItemDto>.toEntries(): List<SAnime> = fetchAll { item ->
+        if (item.seasonCount > 1) seasonEntries(item) else listOf(item.toSAnime())
+    }.flatten()
+
     private fun seasonEntries(item: ContentItemDto): List<SAnime> {
-        val seasonsUrl = "$baseUrl/content/v2/cms/series/${item.id}/seasons?locale=$contentLocale"
-        val seasons = runCatching {
-            client.newCall(GET(seasonsUrl, headers)).execute().parseAs<SeasonsResponseDto>().data
-        }.getOrNull().orEmpty().distinctBy { it.seasonNumber to it.seasonDisplayNumber }
+        val seasons = fetchSeasons(item.id)
 
         if (seasons.size < 2) return listOf(item.toSAnime())
 
         val series = item.toSAnime()
         return seasons.sortedBy { it.seasonNumber }.map { season ->
             SAnime.create().apply {
-                url = "$SEASON_PREFIX${season.guidFor(audioLocale)}:${item.id}"
+                // Only audio-independent ids are stored, so changing the audio
+                // setting does not turn saved entries into new ones.
+                url = "$SEASON_PREFIX${season.stableId}:${item.id}"
                 title = season.cleanTitle.ifEmpty { "${series.title} S${season.seasonNumber}" }
                 thumbnail_url = season.thumbnail ?: series.thumbnail_url
                 description = series.description
@@ -295,9 +325,12 @@ class Crunchyroll : Source() {
         }
     }
 
+    override fun animeDetailsRequest(anime: SAnime) = throw UnsupportedOperationException()
+    override fun animeDetailsParse(response: Response) = throw UnsupportedOperationException()
+
     override fun getAnimeUrl(anime: SAnime) = "$baseUrl/series/${anime.seriesId}"
 
-    /** Season entries are stored as `season:<seasonId>:<seriesId>`. */
+    /** Season entries are stored as `season:<stableSeasonId>:<seriesId>`. */
     private val SAnime.seasonId: String?
         get() = url.takeIf { it.startsWith(SEASON_PREFIX) }
             ?.removePrefix(SEASON_PREFIX)?.substringBefore(':')
@@ -310,33 +343,29 @@ class Crunchyroll : Source() {
     override suspend fun getEpisodeList(anime: SAnime): List<SEpisode> {
         // A season entry maps 1:1 onto a tracker season, so its episodes keep the
         // numbering the tracker expects and need no season label.
-        anime.seasonId?.let { seasonId ->
-            val url = "$baseUrl/content/v2/cms/seasons/$seasonId/episodes?locale=$contentLocale"
-            return client.newCall(GET(url, headers)).execute()
-                .parseAs<EpisodesResponseDto>().data
-                .map { it.toSEpisode("", dateFormat.tryParse(it.date), audioLocale) }
+        anime.seasonId?.let { stableSeasonId ->
+            // The stored id is audio-independent; pick the sibling for the current
+            // audio setting here. If the season cannot be matched, the original is used.
+            val season = fetchSeasons(anime.seriesId).firstOrNull { it.stableId == stableSeasonId }
+            return fetchEpisodes(season?.guidFor(audioLocale) ?: stableSeasonId)
+                .map { it.toSEpisode("", parseDate(it.date)) }
                 .reversed()
         }
 
-        val seasonsUrl = "$baseUrl/content/v2/cms/series/${anime.url}/seasons?locale=$contentLocale"
-        val seasons = client.newCall(GET(seasonsUrl, headers)).execute()
-            .parseAs<SeasonsResponseDto>().data
+        // A series can list the same season once per audio locale; fetchSeasons
+        // already collapses those.
+        val wanted = fetchSeasons(anime.seriesId).sortedBy { it.seasonNumber }
 
-        // A series can list the same season once per audio locale.
-        val wanted = seasons.distinctBy { it.seasonNumber to it.seasonDisplayNumber }
-
-        val bySeason = wanted.sortedBy { it.seasonNumber }
-            .parallelCatchingMapNotNull { season ->
-                val seasonId = season.guidFor(audioLocale)
-                val url = "$baseUrl/content/v2/cms/seasons/$seasonId/episodes?locale=$contentLocale"
-                season to client.newCall(GET(url, headers)).execute()
-                    .parseAs<EpisodesResponseDto>().data
-            }
-            .sortedBy { (season, _) -> season.seasonNumber }
+        // Any failed season fails the whole list: a partial list would misnumber
+        // every later season.
+        val bySeason = wanted.fetchAll { season ->
+            season to fetchEpisodes(season.guidFor(audioLocale))
+        }
 
         // Every season restarts at episode 1, so numbering them as they come makes
         // season 2 collide with season 1 and the app keeps only one of each pair.
-        // Offsetting by the episodes already listed keeps them distinct and ordered.
+        // Each season starts above the highest number the previous one used, which
+        // stays correct when a season has gaps or fractional/special numbers.
         var offset = 0f
         return bySeason.flatMap { (season, episodes) ->
             val label = if (bySeason.size > 1) {
@@ -345,28 +374,69 @@ class Crunchyroll : Source() {
                 ""
             }
             val numbered = episodes.map {
-                it.toSEpisode(label, dateFormat.tryParse(it.date), audioLocale, offset)
+                it.toSEpisode(label, parseDate(it.date), offset)
             }
-            offset += episodes.size
+            numbered.maxOfOrNull { it.episode_number }?.let { offset = ceil(it) }
             numbered
         }.reversed()
     }
 
+    override fun episodeListRequest(anime: SAnime) = throw UnsupportedOperationException()
+    override fun episodeListParse(response: Response) = throw UnsupportedOperationException()
+    override fun seasonListRequest(anime: SAnime) = throw UnsupportedOperationException()
+    override fun seasonListParse(response: Response) = throw UnsupportedOperationException()
+
     override fun getEpisodeUrl(episode: SEpisode) = "$baseUrl/watch/${episode.url}"
 
-    // ============================ Video Links =============================
+    private fun fetchSeasons(seriesId: String): List<SeasonDto> {
+        val url = "$baseUrl/content/v2/cms/series/$seriesId/seasons?locale=$contentLocale"
+        return client.newCall(GET(url, headers)).execute()
+            .parseAs<SeasonsResponseDto>().data
+            // A season can be listed once per audio version. Keep the original-audio one
+            // (its stable id is its own id) so the id stored in the season URL never
+            // points at a dub; a dub is only kept when no sibling qualifies.
+            .groupBy { it.seasonNumber to it.seasonDisplayNumber }
+            .values
+            .map { siblings -> siblings.firstOrNull { it.stableId == it.id } ?: siblings.first() }
+    }
 
-    override suspend fun getVideoList(episode: SEpisode): List<Video> {
+    private fun fetchEpisodes(seasonId: String): List<EpisodeDto> {
+        val url = "$baseUrl/content/v2/cms/seasons/$seasonId/episodes?locale=$contentLocale"
+        return client.newCall(GET(url, headers)).execute()
+            .parseAs<EpisodesResponseDto>().data
+    }
+
+    // SimpleDateFormat is not thread-safe and episode lists are built in parallel,
+    // so every parse gets its own instance.
+    private fun parseDate(date: String?): Long = newDateFormat().tryParse(date)
+
+    // Shared by every parallel lookup this source makes, so a cold listing page cannot
+    // fan out into dozens of simultaneous authenticated requests.
+    private val lookupPermits = Semaphore(MAX_PARALLEL_LOOKUPS)
+
+    // Runs the blocking lookups in parallel, at most MAX_PARALLEL_LOOKUPS at a time; the
+    // first failure cancels the rest and is rethrown so the app can offer a retry.
+    private suspend fun <A, B> List<A>.fetchAll(transform: suspend (A) -> B): List<B> = coroutineScope {
+        this@fetchAll.map { async(Dispatchers.IO) { lookupPermits.withPermit { transform(it) } } }.awaitAll()
+    }
+
+    // ============================== Hosters ===============================
+
+    override suspend fun getHosterList(episode: SEpisode): List<Hoster> {
         // No playback-stopped hook exists, so this is the only reliable place to
         // hand back the previous slot before taking another.
         releasePreviousStream()
 
-        val playUrl = "$PLAY_HOST/v1/${episode.url}/$PLAY_PROFILE/play"
+        // Episode URLs hold the audio-independent id; resolve the version for the
+        // current audio setting now.
+        val mediaId = resolveEpisodeId(episode.url)
+
+        val playUrl = "$PLAY_HOST/v1/$mediaId/$PLAY_PROFILE/play"
         val response = client.newCall(GET(playUrl, headers)).execute()
 
         if (!response.isSuccessful) {
             val body = runCatching { response.peekBody(2048).string() }.getOrDefault("")
-            Log.e(LOG_TAG, "play: ${episode.url} -> HTTP ${response.code} $body")
+            Log.e(LOG_TAG, "play: $mediaId -> HTTP ${response.code} $body")
             val detail = runCatching { response.parseAs<ErrorDto>() }.getOrNull()
             throw IOException(
                 when {
@@ -381,11 +451,70 @@ class Crunchyroll : Source() {
         }
 
         val play = response.parseAs<PlayResponseDto>()
-        play.token?.let {
-            lastStream = episode.url to it
-            startKeepAlive(episode.url, it, play.session)
+        play.token?.let { registerStream(mediaId, it, play.session) }
+
+        val offline = play.drm?.let { offlinePayload(mediaId) }
+
+        val drmPayload = play.drm?.let { drm ->
+            // The license proxy needs all three; any two of them still return 403.
+            DrmPayload(
+                drmScheme = drm.name,
+                licenseUrl = drm.drmUrl,
+                licenseHeaders = buildMap {
+                    put("Authorization", "Bearer ${token()}")
+                    put("x-cr-content-id", mediaId)
+                    play.token?.let { put("x-cr-video-token", it) }
+                },
+                offline = offline,
+            ).toJsonString()
+        }.orEmpty()
+
+        if (play.drm != null && play.token == null) {
+            Log.w(LOG_TAG, "play response had DRM but no stream token - license will 403")
         }
 
+        val title = buildString {
+            append("Crunchyroll")
+            if (play.audioLocale.isNotEmpty()) append(" · ${localeName(play.audioLocale)}")
+            if (play.drm != null) append(" · DRM")
+        }
+
+        return listOf(
+            Hoster(
+                hosterName = title,
+                internalData = play.url,
+                videoList = buildVideoList(play, drmPayload),
+            ),
+        )
+    }
+
+    override fun hosterListRequest(episode: SEpisode) = throw UnsupportedOperationException()
+    override fun hosterListParse(response: Response) = throw UnsupportedOperationException()
+
+    // Falls back to the stored (original-audio) id if the lookup fails, so playback
+    // still works - just not in the chosen dub.
+    private fun resolveEpisodeId(stableId: String): String {
+        val wanted = audioLocale ?: return stableId
+        return runCatching {
+            val url = "$baseUrl/content/v2/cms/objects/$stableId?locale=$contentLocale"
+            client.newCall(GET(url, headers)).execute()
+                .parseAs<ObjectsResponseDto>().data
+                .firstOrNull()?.guidFor(wanted)
+        }.onFailure {
+            Log.w(LOG_TAG, "audio version lookup for $stableId failed: ${it.message}")
+        }.getOrNull() ?: stableId
+    }
+
+    // ============================ Video Links =============================
+
+    override suspend fun getVideoList(hoster: Hoster): List<Video> = hoster.videoList ?: emptyList()
+
+    override fun videoListRequest(hoster: Hoster) = throw UnsupportedOperationException()
+    override fun videoListParse(response: Response, hoster: Hoster) = throw UnsupportedOperationException()
+
+    private fun buildVideoList(play: PlayResponseDto, drmPayload: String): List<Video> {
+        // The player makes these requests itself, outside authIntercept, so the
+        // token cannot be refreshed once it expires.
         val videoHeaders = headersBuilder()
             .set("Authorization", "Bearer ${token()}")
             .build()
@@ -397,34 +526,16 @@ class Crunchyroll : Source() {
             play.captions.forEach { (locale, sub) -> add(Track(sub.url, "${localeName(locale)} (CC)")) }
         }.sortedWith(compareByDescending { it.lang.startsWith(localeName(subtitleLocale)) })
 
-        val offline = play.drm?.let { offlinePayload(episode.url) }
-
-        val drmPayload = play.drm?.let { drm ->
-            // The license proxy needs all three; any two of them still return 403.
-            DrmPayload(
-                drmScheme = drm.name,
-                licenseUrl = drm.drmUrl,
-                licenseHeaders = buildMap {
-                    put("Authorization", "Bearer ${token()}")
-                    put("x-cr-content-id", episode.url)
-                    play.token?.let { put("x-cr-video-token", it) }
-                },
-                offline = offline,
-            ).toJsonString()
-        }.orEmpty()
-
-        if (play.drm != null && play.token == null) {
-            Log.w(LOG_TAG, "play response had DRM but no stream token - license will 403")
+        val title = buildString {
+            append("Crunchyroll")
+            if (play.audioLocale.isNotEmpty()) append(" · ${localeName(play.audioLocale)}")
+            if (play.drm != null) append(" · DRM")
         }
 
         return listOf(
-            legacyVideo(
+            Video(
                 videoUrl = play.url,
-                videoTitle = buildString {
-                    append("Crunchyroll")
-                    if (play.audioLocale.isNotEmpty()) append(" · ${localeName(play.audioLocale)}")
-                    if (play.drm != null) append(" · DRM")
-                },
+                videoTitle = title,
                 headers = videoHeaders,
                 subtitleTracks = subtitles,
                 internalData = drmPayload,
@@ -459,16 +570,101 @@ class Crunchyroll : Source() {
         null
     }
 
-    @Volatile private var lastStream: Pair<String, String>? = null
+    // ============================== Streams ===============================
+
+    // streamLock guards the bookkeeping below and is never held across a request, so a
+    // slow ping or release cannot stall getHosterList. A ping still cannot land after
+    // the release that follows it: releasing first retires the stream (it stops being
+    // lastStream, so no new ping can start for it) and cancels a ping already on the
+    // wire, and only then sends the release.
+    private val streamLock = Any()
+
+    private var lastStream: Pair<String, String>? = null
+
+    // Release requests that have not been confirmed yet; retried on the next call.
+    private val pendingReleases = mutableListOf<Pair<String, String>>()
 
     private val streamScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    @Volatile private var keepAliveJob: Job? = null
+    private var keepAliveJob: Job? = null
+
+    // The keep-alive request on the wire for lastStream, kept so a release can abort it.
+    private var pingCall: Call? = null
+
+    // Pings are small and repeated, so a stuck one is abandoned well before the shared
+    // client's timeouts would.
+    private val pingClient by lazy {
+        client.newBuilder()
+            .callTimeout(PING_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private fun registerStream(id: String, streamToken: String, session: SessionDto?) {
+        val unreleased = synchronized(streamLock) {
+            // A stream registered by an overlapping call is released, not forgotten.
+            retireStream()
+            lastStream = id to streamToken
+            startKeepAlive(id, streamToken, session)
+            pendingReleases.toList()
+        }
+        flushReleases(unreleased)
+    }
+
+    private fun releasePreviousStream() {
+        val unreleased = synchronized(streamLock) {
+            retireStream()
+            pendingReleases.toList()
+        }
+        flushReleases(unreleased)
+    }
+
+    // Caller holds streamLock. Stops the keep-alive for lastStream, aborts a ping in
+    // flight and queues the stream for release. Sends nothing itself.
+    private fun retireStream() {
+        keepAliveJob?.cancel()
+        keepAliveJob = null
+        pingCall?.cancel()
+        pingCall = null
+        lastStream?.let { queueRelease(it) }
+        lastStream = null
+    }
+
+    private fun queueRelease(stream: Pair<String, String>) {
+        pendingReleases.add(stream)
+        while (pendingReleases.size > MAX_PENDING_RELEASES) pendingReleases.removeAt(0)
+    }
+
+    // Runs outside streamLock. Whatever is not confirmed stays queued for next time.
+    private fun flushReleases(streams: List<Pair<String, String>>) {
+        val confirmed = streams.filter { sendInactive(it) }
+        if (confirmed.isNotEmpty()) {
+            synchronized(streamLock) { pendingReleases.removeAll(confirmed) }
+        }
+    }
+
+    // True once the slot is known to be free: success, or the token already being gone.
+    private fun sendInactive(stream: Pair<String, String>): Boolean {
+        val (id, streamToken) = stream
+        return runCatching {
+            // Must be PATCH; a POST is silently ignored and leaks the slot until it
+            // times out, after which play returns 420 TOO_MANY_ACTIVE_STREAMS.
+            val request = Request.Builder()
+                .url("$PLAY_HOST/v1/token/$id/$streamToken/inactive")
+                .headers(headers)
+                .patch(ByteArray(0).toRequestBody())
+                .build()
+            client.newCall(request).execute().use {
+                it.isSuccessful || it.code == 404 || it.code == 410
+            }
+        }.getOrElse {
+            Log.w(LOG_TAG, "release stream token $id failed: ${it.message}")
+            false
+        }
+    }
 
     // A stream token expires ~renewSeconds after it is issued unless pinged, which
-    // drops playback a few minutes in.
+    // drops playback a few minutes in. Caller holds streamLock.
     private fun startKeepAlive(id: String, streamToken: String, session: SessionDto?) {
-        keepAliveJob?.cancel()
         val renew = (session?.renewSeconds ?: 270).coerceAtLeast(60)
         val interval = (renew - 30).coerceAtLeast(30) * 1000L
         val deadline = System.currentTimeMillis() + SESSION_MAX_SECONDS * 1000L
@@ -476,18 +672,7 @@ class Crunchyroll : Source() {
             var failures = 0
             while (isActive && System.currentTimeMillis() < deadline) {
                 delay(interval)
-                if (lastStream?.second != streamToken) return@launch
-                val code = runCatching {
-                    val request = Request.Builder()
-                        .url("$PLAY_HOST/v1/token/$id/$streamToken/active")
-                        .headers(headers)
-                        .patch(ByteArray(0).toRequestBody())
-                        .build()
-                    client.newCall(request).execute().use { it.code }
-                }.getOrElse {
-                    Log.w(LOG_TAG, "keep-alive $id failed: ${it.message}")
-                    return@getOrElse -1
-                }
+                val code = ping(id, streamToken) ?: return@launch
                 // The token is gone; further pings are pointless.
                 if (code == 404 || code == 410) return@launch
                 if (code in 200..299) {
@@ -501,23 +686,35 @@ class Crunchyroll : Source() {
         }
     }
 
-    private fun releasePreviousStream() {
-        keepAliveJob?.cancel()
-        keepAliveJob = null
-        val (id, streamToken) = lastStream ?: return
-        lastStream = null
-        runCatching {
-            // Must be PATCH; a POST is silently ignored and leaks the slot until it
-            // times out, after which play returns 420 TOO_MANY_ACTIVE_STREAMS.
+    // Caller must not hold streamLock. Returns the ping's HTTP status (-1 if it could not
+    // be completed), or null once the stream has been replaced or released.
+    private fun ping(id: String, streamToken: String): Int? {
+        val call = synchronized(streamLock) {
+            // Checked under the lock: once the stream is replaced or released, no further
+            // ping can start for it.
+            if (lastStream?.second != streamToken) return null
             val request = Request.Builder()
-                .url("$PLAY_HOST/v1/token/$id/$streamToken/inactive")
+                .url("$PLAY_HOST/v1/token/$id/$streamToken/active")
                 .headers(headers)
                 .patch(ByteArray(0).toRequestBody())
                 .build()
-            client.newCall(request).execute().use {
-            }
-        }.onFailure { Log.w(LOG_TAG, "release stream token $id failed: ${it.message}") }
+            pingClient.newCall(request).also { pingCall = it }
+        }
+
+        // The request itself runs outside the lock.
+        return try {
+            call.execute().use { it.code }
+        } catch (e: Exception) {
+            // A release cancels the ping in flight; that is expected, not a failure.
+            if (!isCurrentStream(streamToken)) return null
+            Log.w(LOG_TAG, "keep-alive $id failed: ${e.message}")
+            -1
+        } finally {
+            synchronized(streamLock) { if (pingCall === call) pingCall = null }
+        }
     }
+
+    private fun isCurrentStream(streamToken: String) = synchronized(streamLock) { lastStream?.second == streamToken }
 
     // ============================= Utilities ==============================
 
@@ -613,6 +810,9 @@ class Crunchyroll : Source() {
 
         private const val PAGE_SIZE = 36
 
+        /** Simultaneous season/episode lookups across the whole source. */
+        private const val MAX_PARALLEL_LOOKUPS = 4
+
         private const val PLAY_HOST = "https://cr-play-service.prd.crunchyrollsvc.com"
 
         // The service allows six hours, but with no playback-stopped hook a shorter
@@ -621,6 +821,12 @@ class Crunchyroll : Source() {
 
         /** Consecutive renewal failures before the session is presumed dead. */
         private const val MAX_KEEPALIVE_FAILURES = 2
+
+        /** A keep-alive ping slower than this is abandoned and counted as a failure. */
+        private const val PING_TIMEOUT_SECONDS = 15L
+
+        /** Unconfirmed release requests kept for retry. */
+        private const val MAX_PENDING_RELEASES = 5
 
         // A web token only works on `web` paths; android/console answer "Outdated
         // Token". This profile also serves the full 1080p ladder.
@@ -640,7 +846,8 @@ class Crunchyroll : Source() {
         private const val PREF_PASSWORD = "cr_password"
         private const val PREF_DEVICE_ID = "cr_device_id"
 
-        private const val PREF_AUDIO_TYPE = "cr_audio_type"
+        // The key the app's shared sub/dub switch looks for.
+        private const val PREF_AUDIO_TYPE = "is_sub_or_dub"
 
         // Must stay bare "sub"/"dub"; the app matches on that exactly.
         private const val AUDIO_SUB = "sub"
@@ -656,10 +863,8 @@ class Crunchyroll : Source() {
         private const val PREF_LOCALE = "cr_content_locale"
         private const val PREF_LOCALE_DEFAULT = "en-US"
 
-        private val dateFormat by lazy {
-            SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.ROOT).apply {
-                timeZone = TimeZone.getTimeZone("UTC")
-            }
+        private fun newDateFormat() = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.ROOT).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
         }
 
         private val LOCALES = linkedMapOf(
